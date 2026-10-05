@@ -1,6 +1,5 @@
 import socket
 import random
-import time
 
 class SocketTCP:
     def __init__(self):
