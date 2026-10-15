@@ -1,5 +1,14 @@
 import socket
 import random
+import os
+import time
+
+DEBUG = os.environ.get("TCP_DEBUG") == "1"
+LOSS_RATE = float(os.environ.get("TCP_LOSS", "0"))
+
+def debug(msg):
+    if DEBUG:
+        print("[DEBUG]", msg, flush=True)
 
 class SocketTCP:
     def __init__(self):
@@ -10,6 +19,7 @@ class SocketTCP:
         self.timeout = 2.0
         self.recv_buffer = b""
         self.remaining_bytes = 0
+        self.fin_seq = None
 
     @staticmethod
     def create_segment(segment):
@@ -50,16 +60,24 @@ class SocketTCP:
             "seq": self.seq_num,
             "data": b""
         }
-        self.udp_socket.sendto(self.create_segment(syn), address)
-
-        #esperamos un SYN+ACK
-        while True:
-            response_bytes, server_address = self.udp_socket.recvfrom(23)
-            response = self.parse_segment(response_bytes)
-
-            if (response["syn"] and response["ack"] and not response["fin"] and 
-                response["seq"] == self.seq_num + 1 and response["data"] == b""):
-                break
+        previous_timeout = self.udp_socket.gettimeout()
+        self.udp_socket.settimeout(self.timeout)
+        try:
+            connected = False
+            while not connected:
+                self._sendto(self.create_segment(syn), address)
+                try:
+                    while True:
+                        response_bytes, server_address = self.udp_socket.recvfrom(23)
+                        response = self.parse_segment(response_bytes)
+                        if (response["syn"] and response["ack"] and not response["fin"] and
+                            response["seq"] == self.seq_num + 1 and response["data"] == b""):
+                            connected = True
+                            break
+                except socket.timeout:
+                    debug("connect: timeout esperando SYN+ACK, reenvío SYN")
+        finally:
+            self.udp_socket.settimeout(previous_timeout)
 
         #la respuesta viene del nuevo socket del servidor, por lo que debemos actualizar 
         # la dirección de destino
@@ -74,7 +92,7 @@ class SocketTCP:
             "data": b""
         }
 
-        self.udp_socket.sendto(
+        self._sendto(
             self.create_segment(ack),
             self.dest_address
         )
@@ -110,20 +128,32 @@ class SocketTCP:
             "data": b""
         }
 
-        connection_socketTCP.udp_socket.sendto(self.create_segment(syn_ack), client_address)
+        connection_socketTCP.udp_socket.settimeout(self.timeout)
+        established = False
+        while not established:
+            connection_socketTCP._sendto(self.create_segment(syn_ack), client_address)
+            try:
+                while True:
+                    ack_bytes, sender_address = connection_socketTCP.udp_socket.recvfrom(23)
+                    ack = self.parse_segment(ack_bytes)
+                    if sender_address != client_address:
+                        continue
+                    # llega el ACK final
+                    if (ack["ack"] and not ack["syn"] and not ack["fin"]
+                            and ack["seq"] == syn["seq"] + 2 and ack["data"] == b""):
+                        established = True
+                        break
+                    # se perdió el ACK final y el cliente ya mandó datos, damos la conexión por establecida y NO lo ACKeamos
+                    # el cliente lo retransmite y lo recibe recv()
+                    if (not ack["ack"] and not ack["syn"] and not ack["fin"]
+                            and ack["seq"] == syn["seq"] + 2):
+                        established = True
+                        break
+            except socket.timeout:
+                debug("accept: timeout esperando ACK final, reenvío SYN+ACK")
 
-        #esperamos el ACK final
-        while True:
-            ack_bytes, sender_address = (connection_socketTCP.udp_socket.recvfrom(23))
-            ack = self.parse_segment(ack_bytes)
-
-            if (sender_address == client_address and ack["ack"] and not ack["syn"] and 
-                not ack["fin"] and ack["seq"] == syn["seq"] + 2 and ack["data"] == b""):
-                break
-
-        #secuencia esperada
+        connection_socketTCP.udp_socket.settimeout(None)   # vuelve a bloqueante
         connection_socketTCP.expected_seq_num = syn["seq"] + 2
-
         return connection_socketTCP, new_address
 
     def send(self, message):
@@ -156,7 +186,7 @@ class SocketTCP:
 
                 while not confirmed:
                     #enviamos el segmento
-                    self.udp_socket.sendto(segment_bytes, self.dest_address)
+                    self._sendto(segment_bytes, self.dest_address)
 
                     try:
                         while True:
@@ -189,6 +219,9 @@ class SocketTCP:
             raise ValueError("buff_size no puede ser negativo")
 
         if buff_size == 0:
+            return b""
+
+        if self.fin_seq is not None and self.remaining_bytes == 0:
             return b""
 
         waiting_length = self.remaining_bytes == 0
@@ -224,6 +257,11 @@ class SocketTCP:
 
             segment = self.parse_segment(segment_bytes)
 
+            if segment["fin"] and not segment["ack"] and not segment["syn"]:
+                debug("recv: recibí FIN")
+                self.fin_seq = segment["seq"]
+                return message_received     # b"" si no había mensaje en curso
+
             if segment["ack"] or segment["syn"] or segment["fin"]:
                 #si el segmento es un ACK, SYN o FIN, lo ignoramos
                 continue
@@ -253,4 +291,108 @@ class SocketTCP:
             }
 
             #enviamos el ACK correspondiente al segmento recibido
-            self.udp_socket.sendto(self.create_segment(ack), self.dest_address)
+            self._sendto(self.create_segment(ack), self.dest_address)
+
+
+    def _sendto(self, segment_bytes, address):
+        if LOSS_RATE > 0 and random.random() < LOSS_RATE:
+            debug(f"PERDIDO al enviar -> {self.parse_segment(segment_bytes)}")
+            return
+        self.udp_socket.sendto(segment_bytes, address)
+
+    def close(self):
+        """Host A: FIN -> espera FIN+ACK, hasta 3 timeouts -> ACK x3"""
+        fin = {
+            "ack": False,
+            "syn": False,
+            "fin": True,
+            "seq": self.seq_num,
+            "data": b""
+        }
+        self.udp_socket.settimeout(self.timeout)
+
+        got_fin_ack = False
+        for attempt in range(3):
+            self._sendto(self.create_segment(fin), self.dest_address)
+            try:
+                while True:
+                    seg_bytes, sender = self.udp_socket.recvfrom(23)
+                    if sender != self.dest_address:
+                        continue
+                    seg = self.parse_segment(seg_bytes)
+                    if (seg["fin"] and seg["ack"] and not seg["syn"]
+                            and seg["seq"] == self.seq_num + 1):
+                        got_fin_ack = True
+                        break
+            except socket.timeout:
+                debug(f"close: timeout {attempt + 1}/3 esperando FIN+ACK")
+                continue
+            if got_fin_ack:
+                break
+
+        if got_fin_ack:
+            ack = {
+            "ack": True,
+            "syn": False,
+            "fin": False,
+            "seq": self.seq_num + 2,
+            "data": b""
+        }
+            for i in range(3):
+                self._sendto(self.create_segment(ack), self.dest_address)
+                if i < 2:
+                    time.sleep(self.timeout)
+        else:
+            debug("close: 3 timeouts, la contraparte cerró")
+
+        self.udp_socket.close()
+
+    def recv_close(self):
+        """Host B: (espera FIN) -> FIN+ACK -> espera ACK final, hasta 3 timeouts"""
+        if self.fin_seq is None:
+            self.udp_socket.settimeout(None)
+            while self.fin_seq is None:
+                seg_bytes, sender = self.udp_socket.recvfrom(23)
+                if sender != self.dest_address:
+                    continue
+                seg = self.parse_segment(seg_bytes)
+                if seg["fin"] and not seg["ack"] and not seg["syn"]:
+                    self.fin_seq = seg["seq"]
+                elif not (seg["ack"] or seg["syn"] or seg["fin"]):
+                    # dato retransmitido porque se perdió nuestro último ACK
+                    ack = {
+                        "ack": True,
+                        "syn": False,
+                        "fin": False,
+                        "seq": self.expected_seq_num,
+                        "data": b""
+                    }
+                    self._sendto(self.create_segment(ack), self.dest_address)
+
+        fin_ack = {
+            "ack": True,
+            "syn": False,
+            "fin": True,
+            "seq": self.fin_seq + 1,
+            "data": b""
+        }
+        self.udp_socket.settimeout(self.timeout)
+
+        for attempt in range(3):
+            self._sendto(self.create_segment(fin_ack), self.dest_address)
+            try:
+                while True:
+                    seg_bytes, sender = self.udp_socket.recvfrom(23)
+                    if sender != self.dest_address:
+                        continue
+                    seg = self.parse_segment(seg_bytes)
+                    if (seg["ack"] and not seg["syn"] and not seg["fin"]
+                            and seg["seq"] == self.fin_seq + 2):
+                        self.udp_socket.close()
+                        return
+            except socket.timeout:
+                debug(f"recv_close: timeout {attempt + 1}/3 esperando ACK final")
+
+        debug("recv_close: 3 timeouts, la contraparte cerró")
+        self.udp_socket.close()
+

@@ -1,18 +1,12 @@
+import sys
 import SocketTCP
 
-address = ("localhost", 8000)
+host = sys.argv[1]
+port = int(sys.argv[2])
 
-# client
+data = sys.stdin.buffer.read()
+
 client_socketTCP = SocketTCP.SocketTCP()
-client_socketTCP.connect(address)
-print("Handshake completado. Destino:", client_socketTCP.dest_address)
-
-# test 1
-message = "Mensje de len=16".encode()
-client_socketTCP.send(message)
-# test 2
-message = "Mensaje de largo 19".encode()
-client_socketTCP.send(message)
-# test 3
-message = "Mensaje de largo 19".encode()
-client_socketTCP.send(message)
+client_socketTCP.connect((host, port))
+client_socketTCP.send(data)
+client_socketTCP.close()
