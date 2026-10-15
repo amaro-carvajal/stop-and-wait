@@ -1,5 +1,0 @@
-[DEBUG] PERDIDO al enviar -> {'ack': True, 'syn': False, 'fin': False, 'seq': 48, 'data': b''}
-Este es un archivo de prueba con mas de dieciseis bytes para pro[DEBUG] PERDIDO al enviar -> {'ack': True, 'syn': False, 'fin': False, 'seq': 50, 'data': b''}
-[DEBUG] PERDIDO al enviar -> {'ack': True, 'syn': False, 'fin': False, 'seq': 50, 'data': b''}
-bar el envio por trozos.
-[DEBUG] recv: recibí FIN
