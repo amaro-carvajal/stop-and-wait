@@ -2,13 +2,14 @@ import socket
 import random
 import os
 import time
+import sys
 
 DEBUG = os.environ.get("TCP_DEBUG") == "1"
 LOSS_RATE = float(os.environ.get("TCP_LOSS", "0"))
 
 def debug(msg):
     if DEBUG:
-        print("[DEBUG]", msg, flush=True)
+        print("[DEBUG]", msg, file=sys.stderr, flush=True)
 
 class SocketTCP:
     def __init__(self):
@@ -209,6 +210,7 @@ class SocketTCP:
 
                     except socket.timeout:
                         #volvemos a enviar el mismo segmento
+                        debug(f"send: timeout esperando ACK de seq={self.seq_num}, retransmito")
                         continue
 
         finally:
@@ -281,6 +283,8 @@ class SocketTCP:
                     self.recv_buffer += segment["data"]
 
                 self.expected_seq_num += 1
+            else:
+                debug(f"recv: duplicado seq={segment['seq']}, reenvío ACK")
 
             ack = {
                 "ack": True,
